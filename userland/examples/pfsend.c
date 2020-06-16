@@ -112,8 +112,41 @@ struct timeval lastTime, startTime;
 int reforge_ip = 0, on_the_fly_reforging = 0;
 int send_len = 60;
 int daemon_mode = 0;
+int forge_stream_id = 0;
+int stream_id = 0;
 
 #define DEFAULT_DEVICE     "eth0"
+
+/* *************************************** */
+
+void DumpHex(const void* data, size_t size) {
+        char ascii[17];
+        size_t i, j;
+        ascii[16] = '\0';
+        for (i = 0; i < size; ++i) {
+                printf("%02X ", ((unsigned char*)data)[i]);
+                if (((unsigned char*)data)[i] >= ' ' && ((unsigned char*)data)[i] <= '~') {
+                        ascii[i % 16] = ((unsigned char*)data)[i];
+                } else {
+                        ascii[i % 16] = '.';
+                }
+                if ((i+1) % 8 == 0 || i+1 == size) {
+                        printf(" ");
+                        if ((i+1) % 16 == 0) {
+                                printf("|  %s \n", ascii);
+                        } else if (i+1 == size) {
+                                ascii[(i+1) % 16] = '\0';
+                                if ((i+1) % 16 <= 8) {
+                                        printf(" ");
+                                }
+                                for (j = (i+1) % 16; j < 16; ++j) {
+                                        printf("   ");
+                                }
+                                printf("|  %s \n", ascii);
+                        }
+                }
+        }
+}
 
 /* *************************************** */
 
@@ -257,12 +290,13 @@ void printHelp(void) {
   printf("-O              On the fly reforging instead of preprocessing (-b)\n");
   printf("-z              Randomize generated IPs sequence\n");
   printf("-o <num>        Offset for generated IPs (-b) or packets in pcap (-f)\n");
-  printf("-L <num>        Forge VLAN packets with <num> different ids\n");
+  printf("-L <num>        Forge VLAN packets with <num> vlan\n");
   printf("-F              Force flush for each packet (to avoid bursts, expect low performance)\n");
   printf("-w <watermark>  TX watermark (low value=low latency) [not effective on ZC]\n");
   printf("-d              Daemon mode\n");
   printf("-P <pid file>   Write pid to the specified file (daemon mode only)\n");
   printf("-v              Verbose\n");
+  printf("-X <num>        Forge packets with <num> as stream id\n");
   exit(0);
 }
 
@@ -276,6 +310,22 @@ static int reforge_packet(u_char *buffer, u_int buffer_len, u_int idx, u_int use
   if (reforge_dst_mac) memcpy(buffer, dstmac, 6);
   if (reforge_src_mac) memcpy(&buffer[6], srcmac, 6);
 
+  if (!reforge_ip && forge_stream_id) {
+    if (!use_prev_hdr) {
+      memset(&hdr, 0, sizeof(hdr));
+      hdr.len = hdr.caplen = buffer_len;
+
+      if (pfring_parse_pkt(buffer, &hdr, 4, 0, 0) < 3)
+        return -1;
+      if (hdr.extended_hdr.parsed_pkt.ip_version != 4)
+        return -1;
+    }
+    ip_header = (struct ip_header *) &buffer[hdr.extended_hdr.parsed_pkt.offset.l3_offset];
+    ip_header->id = htons(stream_id);
+    ip_header->check = 0;
+    ip_header->check = wrapsum(in_cksum((unsigned char *) ip_header, sizeof(struct ip_header), 0));
+
+  }
   if (reforge_ip) {
     if (!use_prev_hdr) {
       memset(&hdr, 0, sizeof(hdr));
@@ -286,10 +336,12 @@ static int reforge_packet(u_char *buffer, u_int buffer_len, u_int idx, u_int use
       if (hdr.extended_hdr.parsed_pkt.ip_version != 4)
         return -1;
     }
-
     ip_header = (struct ip_header *) &buffer[hdr.extended_hdr.parsed_pkt.offset.l3_offset];
     ip_header->daddr = dstaddr.s_addr;
     ip_header->saddr = htonl((ntohl(srcaddr.s_addr) + ip_offset + (idx % num_ips)) & 0xFFFFFFFF);
+    if (forge_stream_id) {
+        ip_header->id = htons(stream_id);
+    }
     ip_header->check = 0;
     ip_header->check = wrapsum(in_cksum((unsigned char *) ip_header, sizeof(struct ip_header), 0));
 
@@ -355,7 +407,7 @@ int main(int argc, char* argv[]) {
   srcaddr.s_addr = 0x0100000A /* 10.0.0.1 */;
   dstaddr.s_addr = 0x0100A8C0 /* 192.168.0.1 */;
 
-  while((c = getopt(argc, argv, "A:b:B:dD:hi:n:g:l:L:o:Oaf:Fr:vm:M:p:P:S:t:w:V:z8:")) != -1) {
+  while((c = getopt(argc, argv, "A:b:B:dD:hi:n:g:l:L:o:Oaf:Fr:vm:M:p:P:S:t:w:V:X:z8:")) != -1) {
     switch(c) {
     case 'A':
       uniq_pkts_per_sec = atoi(optarg);
@@ -405,8 +457,6 @@ int main(int argc, char* argv[]) {
     case 'L':
       forge_vlan = 1;
       num_vlan = atoi(optarg);
-      if (num_uniq_pkts < num_vlan)
-        num_uniq_pkts = num_vlan;
       break;
     case 'v':
       verbose = 1;
@@ -463,6 +513,10 @@ int main(int argc, char* argv[]) {
       if (num_uniq_pkts < num_ips * num_ports)
         num_uniq_pkts = num_ips * num_ports;
       reforge_ip = 1;
+      break;
+    case 'X':
+      forge_stream_id = 1;
+      stream_id = atoi(optarg);
       break;
     case 'z':
       randomize = 1;
@@ -586,7 +640,7 @@ int main(int argc, char* argv[]) {
           if (datalink == DLT_LINUX_SLL) p->len -= 2;
 	  p->ticks_from_beginning = (((h->ts.tv_sec - beginning.tv_sec) * 1000000) + (h->ts.tv_usec - beginning.tv_usec)) * hz / 1000000;
 	  p->next = NULL;
-	  p->pkt = (u_char *)malloc(p->len);
+	  p->pkt = (u_char *)malloc(p->len + 5); // +4 for vlan, +1 for stream id
 
 	  if(p->pkt == NULL) {
 	    printf("Not enough memory\n");
@@ -597,9 +651,21 @@ int main(int argc, char* argv[]) {
               memcpy(&p->pkt[12], &pkt[14], p->len - 14);
 	    } else {
 	      memcpy(p->pkt, pkt, p->len);
-            }
-	    if(reforge_dst_mac || reforge_src_mac || reforge_ip)
-              reforge_packet((u_char *) p->pkt, p->len, ip_offset + num_pcap_pkts, 0); 
+        }
+	    if(reforge_dst_mac || reforge_src_mac || reforge_ip || forge_stream_id)
+              reforge_packet((u_char *) p->pkt, p->len, ip_offset + num_pcap_pkts, 0);
+        if (forge_vlan) {
+                  memmove(&p->pkt[16], &p->pkt[12], p->len - 12);
+                  p->len += 4;
+                  p->pkt[12] = 0x81;
+                  p->pkt[13] = 0x00;
+                  p->pkt[14] = (num_vlan >> 8) & 0xff;
+                  p->pkt[15] = (num_vlan) & 0xff;
+        }
+        if (forge_stream_id) {
+          p->pkt[p->len] = stream_id & 0xff;
+          p->len+=1;
+        }
 	  }
 
 	  if(last) {
